@@ -1,3 +1,4 @@
+
 name: RDP
 
 on:
@@ -9,176 +10,210 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Free Temporary Disk Space
-        shell: powershell
+      - name: Prepare Windows, RDP and Microphone
+        shell: pwsh
         run: |
-          Write-Host "=== Disk space before cleanup ==="
-          Get-PSDrive C
+          $ErrorActionPreference = "Stop"
 
-          $tempPaths = @(
-            $env:TEMP,
-            "$env:WINDIR\Temp"
-          )
+          Write-Host "Windows ve RDP hazirlaniyor..."
 
-          foreach ($path in $tempPaths) {
-            if (Test-Path $path) {
-              Get-ChildItem -LiteralPath $path -Force `
-                -ErrorAction SilentlyContinue |
-                Remove-Item -Recurse -Force `
-                -ErrorAction SilentlyContinue
-            }
-          }
+          # RDP ayarlari
+          $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          Set-ItemProperty -Path $rdpPath -Name fDenyTSConnections -Value 0
 
-          Write-Host "=== Disk space after cleanup ==="
-          Get-PSDrive C
+          $tcpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $tcpPath -Name UserAuthentication -Value 0
+          Set-ItemProperty -Path $tcpPath -Name SecurityLayer -Value 0
 
-      - name: Configure Core RDP Settings
-        shell: powershell
-        run: |
-          $tsPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
-          $rdpPath = "$tsPath\WinStations\RDP-Tcp"
-          $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          # MIKROFON VE SES YONLENDIRME
+          $audioPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $audioPath -Force | Out-Null
 
-          Set-ItemProperty -Path $tsPath `
-            -Name fDenyTSConnections -Value 0 -Force
+          New-ItemProperty -Path $audioPath `
+            -Name fDisableAudioCapture -Value 0 `
+            -PropertyType DWord -Force | Out-Null
 
-          Set-ItemProperty -Path $rdpPath `
-            -Name UserAuthentication -Value 0 -Force
+          New-ItemProperty -Path $audioPath `
+            -Name fDisableAudioPlayback -Value 0 `
+            -PropertyType DWord -Force | Out-Null
 
-          Set-ItemProperty -Path $rdpPath `
-            -Name SecurityLayer -Value 0 -Force
+          Write-Host "Mikrofon ve ses ilkeleri ayarlandi."
 
-          New-Item -Path $policyPath -Force | Out-Null
+          # Guvenlik duvari
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
 
-          New-ItemProperty -Path $policyPath `
-            -Name fDisableAudioCapture `
-            -PropertyType DWord -Value 0 -Force | Out-Null
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow | Out-Null
 
-          New-ItemProperty -Path $rdpPath `
-            -Name fDisableAudioCapture `
-            -PropertyType DWord -Value 0 -Force | Out-Null
-
-          gpupdate /force
-
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-
-          netsh advfirewall firewall add rule `
-            name="RDP-Tailscale" dir=in action=allow `
-            protocol=TCP localport=3389
-
-          Restart-Service -Name TermService -Force
-
-          Write-Host "RDP and microphone redirection settings applied."
-
-      - name: Create RDP User with Secure Password
-        shell: powershell
-        run: |
+          # RDP kullanicisi ve parola
           $username = "Draghyper"
-          $existingUser = Get-LocalUser -Name $username `
-            -ErrorAction SilentlyContinue
+          $chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#_-"
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) +
-                       [char[]](91..96) + [char[]](123..126))
-          }
+          $password = -join (1..20 | ForEach-Object {
+            $bytes = New-Object byte[] 4
+            $rng.GetBytes($bytes)
+            $index = [BitConverter]::ToUInt32($bytes, 0) % $chars.Length
+            $chars[[int]$index]
+          })
 
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $rng.Dispose()
 
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
-          if ($existingUser) {
-            Set-LocalUser -Name $username -Password $securePass
+          if ($existing) {
+            Set-LocalUser -Name $username -Password $securePassword
+            Enable-LocalUser -Name $username
           } else {
             New-LocalUser -Name $username `
-              -Password $securePass -AccountNeverExpires
+              -Password $securePassword `
+              -PasswordNeverExpires | Out-Null
           }
 
-          Add-LocalGroupMember -Group Administrators `
+          Add-LocalGroupMember -Group "Administrators" `
             -Member $username -ErrorAction SilentlyContinue
 
           Add-LocalGroupMember -Group "Remote Desktop Users" `
             -Member $username -ErrorAction SilentlyContinue
 
-          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
-          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          "RDP_USERNAME=$username" | Out-File $env:GITHUB_ENV -Append
+          "RDP_PASSWORD=$password" | Out-File $env:GITHUB_ENV -Append
 
-          Write-Host "RDP account configured."
+          # RDP hizmetini baslat
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
 
-      - name: Install Tailscale
-        shell: powershell
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          gpupdate /target:computer /force
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Restart-Service -Name TermService -Force
 
-          Start-Process msiexec.exe `
-            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait
+          Write-Host "Windows ve RDP ayarlari tamamlandi."
 
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-
-      - name: Establish Tailscale Connection
-        shell: powershell
+      - name: Install and connect Tailscale
+        shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-            throw "Add TAILSCALE_AUTH_KEY in repository Actions secrets."
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY GitHub Secret eksik."
           }
 
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $installer = "$env:TEMP\tailscale-setup.msi"
 
-          & $tsExe up `
-            --authkey=$env:TAILSCALE_AUTH_KEY `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID
+          Invoke-WebRequest `
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
 
-          $tsIP = $null
-          for ($i = 0; $i -lt 12 -and -not $tsIP; $i++) {
-            Start-Sleep -Seconds 5
-            $result = & $tsExe ip -4
-            if ($LASTEXITCODE -eq 0 -and $result) {
-              $tsIP = ($result | Select-Object -First 1).Trim()
-            }
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $tailscale)) {
+            throw "Tailscale kurulumu basarisiz."
           }
 
-          if (-not $tsIP) {
-            throw "Tailscale IP was not assigned."
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          & $tailscale up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=$hostname"
+
+          Start-Sleep -Seconds 5
+
+          $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if (!$ip) {
+            throw "Tailscale IP adresi alinamadi."
           }
 
-          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append
 
-      - name: Verify RDP Accessibility
-        shell: powershell
+          Write-Host "Tailscale baglantisi hazir."
+
+      - name: Verify and display system information
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Continue"
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor
+          $computer = Get-CimInstance Win32_ComputerSystem
+
+          Write-Host ""
+          Write-Host "========== SISTEM BILGILERI =========="
+          Write-Host "Bilgisayar: $env:COMPUTERNAME"
+          Write-Host "Windows: $($os.Caption)"
+          Write-Host "Surum: $($os.Version)"
+          Write-Host "Islemci: $($cpu.Name)"
+          Write-Host ("RAM: {0:N2} GB" -f ($computer.TotalPhysicalMemory / 1GB))
+
+          Write-Host ""
+          Write-Host "========== DISKLER =========="
+
+          Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+            ForEach-Object {
+              Write-Host ("{0} Toplam: {1:N2} GB | Bos: {2:N2} GB" -f
+                $_.DeviceID, ($_.Size / 1GB), ($_.FreeSpace / 1GB))
+            }
+
+          Write-Host ""
+          Write-Host "========== GRAFIK =========="
+
+          Get-CimInstance Win32_VideoController |
+            ForEach-Object { Write-Host $_.Name }
+
+          Write-Host ""
+          Write-Host "========== RDP VE SES =========="
+          Write-Host "RDP portu: 3389"
+          Write-Host "Kullanici: $env:RDP_USERNAME"
+
+          $listener = Get-NetTCPConnection -LocalPort 3389 `
+            -State Listen -ErrorAction SilentlyContinue
+
+          Write-Host "RDP dinleme: $(if ($listener) {'HAZIR'} else {'KONTROL GEREKIYOR'})"
+          Write-Host "Mikrofon yonlendirme ilkesi: Etkinlestirildi"
+          Write-Host "Ses cikisi yonlendirme ilkesi: Etkinlestirildi"
+
+          Write-Host ""
+          Write-Host "========== AG =========="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-          $result = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP -Port 3389
+          Write-Host ""
+          Write-Host "========== SERVISLER =========="
 
-          if (-not $result.TcpTestSucceeded) {
-            Write-Warning "RDP port test failed; check listener and network settings."
-          } else {
-            Write-Host "TCP connectivity successful."
-          }
+          Get-Service TermService,Tailscale -ErrorAction SilentlyContinue |
+            Format-Table Name,Status,StartType -AutoSize |
+            Out-String | Write-Host
 
-      - name: Maintain Connection
-        shell: powershell
+          Write-Host ""
+          Write-Host "========== BAGLANTI BILGILERI =========="
+          Write-Host "Adres: $env:TAILSCALE_IP"
+          Write-Host "Port: 3389"
+          Write-Host "Kullanici adi: $env:RDP_USERNAME"
+          Write-Host "Parola: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "========== HAZIRLIK TAMAMLANDI =========="
+
+      - name: Maintain connection
+        shell: pwsh
         run: |
-          Write-Host "RDP address: $env:TAILSCALE_IP"
-          Write-Host "RDP username: $env:RDP_USERNAME"
-          Write-Host "Password is generated for this run; retrieve it only through a secure channel."
+          Write-Host "Windows oturumu calisiyor."
 
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP active"
+            Write-Host "Durum: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
             Start-Sleep -Seconds 300
           }
           
