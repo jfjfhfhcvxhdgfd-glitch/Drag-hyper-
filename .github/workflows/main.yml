@@ -1,3 +1,4 @@
+
 name: RDP
 
 on:
@@ -12,234 +13,202 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1. WINDOWS, RDP, KULLANICI, PAROLA VE SES AYARLARI
-      - name: Configure Windows RDP Audio and User
+      - name: Validate Secrets
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret eksik."
+          }
+          if ($env:RDP_PASSWORD.Length -lt 12 -or
+              $env:RDP_PASSWORD -notmatch '[A-Z]' -or
+              $env:RDP_PASSWORD -notmatch '[a-z]' -or
+              $env:RDP_PASSWORD -notmatch '\d' -or
+              $env:RDP_PASSWORD -notmatch '[^a-zA-Z0-9]') {
+            throw "RDP_PASSWORD en az 12 karakter; büyük harf, küçük harf, rakam ve sembol içermeli."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY secret eksik."
+          }
+          Write-Host "Gerekli secret kontrolleri tamamlandı."
+
+      - name: Configure Windows RDP
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Parolayi gizli degerden al
-          $password = $env:RDP_PASSWORD
-
-          if ([string]::IsNullOrWhiteSpace($password)) {
-            throw "RDP_PASSWORD Secret eksik."
-          }
-
-          # Windows parola ilkesi icin temel kontrol
-          if ($password.Length -lt 14) {
-            throw "RDP_PASSWORD en az 14 karakter olmali."
-          }
-
-          $categories = 0
-          if ($password -cmatch '[A-Z]') { $categories++ }
-          if ($password -cmatch '[a-z]') { $categories++ }
-          if ($password -match '[0-9]') { $categories++ }
-          if ($password -match '[^a-zA-Z0-9]') { $categories++ }
-
-          if ($categories -lt 3) {
-            throw "Parola buyuk harf, kucuk harf, rakam ve sembol kategorilerinden en az ucunu icermeli."
-          }
-
           $securePassword = ConvertTo-SecureString `
-            $password -AsPlainText -Force
+            $env:RDP_PASSWORD -AsPlainText -Force
 
-          # RDP'yi etkinlestir
-          $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
-          Set-ItemProperty -Path $rdpPath `
-            -Name fDenyTSConnections -Value 0
+          $user = Get-LocalUser -Name "Draghyper" -ErrorAction SilentlyContinue
 
-          # Ag Duzeyinde Kimlik Dogrulamasi acik kalsin
-          $tcpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-          Set-ItemProperty -Path $tcpPath `
-            -Name UserAuthentication -Value 1
-
-          # Ses ve mikrofon yonlendirme ilkeleri
-          $audioPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          New-Item -Path $audioPath -Force | Out-Null
-
-          New-ItemProperty -Path $audioPath `
-            -Name fDisableAudioCapture -Value 0 `
-            -PropertyType DWord -Force | Out-Null
-
-          New-ItemProperty -Path $audioPath `
-            -Name fDisableAudioPlayback -Value 0 `
-            -PropertyType DWord -Force | Out-Null
-
-          # Draghyper kullanicisini olustur veya parolasini yenile
-          try {
-            $user = Get-LocalUser -Name "Draghyper" `
-              -ErrorAction SilentlyContinue
-
-            if ($null -eq $user) {
-              New-LocalUser -Name "Draghyper" `
-                -Password $securePassword `
-                -PasswordNeverExpires `
-                -AccountNeverExpires `
-                -ErrorAction Stop | Out-Null
-            } else {
-              Set-LocalUser -Name "Draghyper" `
-                -Password $securePassword `
-                -ErrorAction Stop
-            }
-          } catch {
-            throw "Draghyper hesabi veya parolasi ayarlanamadi. Secret degerini ve Windows parola ilkesini kontrol et. Ayrinti: $($_.Exception.Message)"
+          if ($null -eq $user) {
+            New-LocalUser -Name "Draghyper" `
+              -Password $securePassword `
+              -Description "RDP account" | Out-Null
+          } else {
+            Set-LocalUser -Name "Draghyper" -Password $securePassword
           }
-
-          # Uzak masaustu ve yonetici gruplari
-          Add-LocalGroupMember -Group "Remote Desktop Users" `
-            -Member "Draghyper" -ErrorAction SilentlyContinue
 
           Add-LocalGroupMember -Group "Administrators" `
             -Member "Draghyper" -ErrorAction SilentlyContinue
 
-          # RDP guvenlik duvari kurallari
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $rdpPath -Name UserAuthentication -Value 1
+          Set-ItemProperty -Path $rdpPath -Name SecurityLayer -Value 2
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
           if (-not (Get-NetFirewallRule -Name "RDP-Tailscale" `
               -ErrorAction SilentlyContinue)) {
             New-NetFirewallRule -Name "RDP-Tailscale" `
-              -DisplayName "RDP via Tailscale" `
-              -Direction Inbound -Protocol TCP `
-              -LocalPort 3389 -Action Allow -Profile Any | Out-Null
+              -DisplayName "RDP over Tailscale" `
+              -Direction Inbound -Protocol TCP -LocalPort 3389 `
+              -Action Allow | Out-Null
           }
 
           Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
+          Restart-Service -Name TermService -Force
 
-          Write-Host "Windows RDP, kullanici ve ses ilkeleri ayarlandi."
-          Write-Host "Parola guvenlik nedeniyle yazdirilmadi."
+          Write-Host "Windows RDP ayarları tamamlandı."
 
-      # 2. TAILSCALE KURULUMU VE BAGLANTI
-      - name: Install and Connect Tailscale
+      - name: Enable RDP Audio and Microphone Redirection
         shell: pwsh
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "TAILSCALE_AUTH_KEY Secret eksik."
+          $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $policyPath -Force | Out-Null
+
+          # 0 = ses kaydı/mikrofon yönlendirmesi engellenmesin
+          New-ItemProperty -Path $policyPath `
+            -Name fDisableAudioCapture -PropertyType DWord `
+            -Value 0 -Force | Out-Null
+
+          # 0 = ses çalma yönlendirmesi engellenmesin
+          New-ItemProperty -Path $policyPath `
+            -Name fDisableAudioPlayback -PropertyType DWord `
+            -Value 0 -Force | Out-Null
+
+          # Ses hizmetlerini etkinleştirmeyi ve başlatmayı dene
+          foreach ($serviceName in @("AudioEndpointBuilder", "Audiosrv")) {
+            $service = Get-Service -Name $serviceName `
+              -ErrorAction SilentlyContinue
+
+            if ($null -ne $service) {
+              try {
+                Set-Service -Name $serviceName -StartupType Automatic `
+                  -ErrorAction Stop
+                Start-Service -Name $serviceName -ErrorAction Stop
+                Write-Host "$serviceName başlatıldı."
+              } catch {
+                Write-Warning "$serviceName başlatılamadı: $($_.Exception.Message)"
+              }
+            } else {
+              Write-Warning "$serviceName bu Windows kurulumunda bulunamadı."
+            }
           }
 
+          Write-Host "Mikrofon/ses yönlendirme ilkeleri:"
+          Get-ItemProperty -Path $policyPath |
+            Select-Object fDisableAudioCapture, fDisableAudioPlayback |
+            Format-List
+
+          Write-Host "Not: Mikrofonun görünmesi, RDP istemcisinin ve oturumun yönlendirmeyi desteklemesine de bağlıdır."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           $msi = Join-Path $env:TEMP "tailscale-setup.msi"
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi
 
-          Invoke-WebRequest -Uri $url -OutFile $msi
-
-          $install = Start-Process msiexec.exe `
-            -ArgumentList @("/i", $msi, "/qn", "/norestart") `
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart" `
             -Wait -PassThru
 
-          if ($install.ExitCode -ne 0) {
-            throw "Tailscale kurulumu basarisiz. MSI kodu: $($install.ExitCode)"
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale kurulumu başarısız. Kod: $($process.ExitCode)"
           }
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
           if (-not (Test-Path $tailscale)) {
-            throw "Tailscale programi bulunamadi."
+            throw "Tailscale programı bulunamadı."
           }
 
-          # Tailscale hizmetinin baslamasini bekle
-          $ready = $false
+          "TAILSCALE_EXE=$tailscale" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
 
-          for ($i = 0; $i -lt 30; $i++) {
-            $service = Get-Service -Name Tailscale `
-              -ErrorAction SilentlyContinue
-
-            if ($null -ne $service -and $service.Status -eq "Running") {
-              $ready = $true
-              break
-            }
-
-            if ($null -ne $service -and $service.Status -ne "Running") {
-              Start-Service -Name Tailscale `
-                -ErrorAction SilentlyContinue
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $ready) {
-            throw "Tailscale hizmeti baslatilamadi."
-          }
-
-          # Anahtari gunluge yazdirmadan baglan
-          & $tailscale up `
-            "--auth-key=$env:TS_AUTHKEY" `
-            "--hostname=gh-runner-$env:GITHUB_RUN_ID"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale girisi basarisiz. Auth Key ve cihaz politikasini kontrol et."
-          }
-
-          # IPv4 adresini bekle
-          $ip = $null
-
-          for ($i = 0; $i -lt 30; $i++) {
-            $ips = & $tailscale ip -4 2>$null
-
-            if ($LASTEXITCODE -eq 0 -and $ips) {
-              $ip = ($ips | Select-Object -First 1).Trim()
-
-              if (-not [string]::IsNullOrWhiteSpace($ip)) {
-                break
-              }
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Tailscale IPv4 adresi alinamadi."
-          }
-
-          "RDP_IP=$ip" | Out-File `
-            -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          Write-Host "Tailscale baglantisi basarili."
-          Write-Host "RDP IP adresi: $ip"
-
-      # 3. BAGLANTI BILGILERI VE DURUM KONTROLU
-      - name: Verify RDP and Show Connection Information
+      - name: Connect Tailscale
         shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
 
-          Write-Host "Windows surumu:"
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version
+          & $env:TAILSCALE_EXE up `
+            --auth-key="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="$hostname"
 
-          Write-Host "Islemci ve bellek:"
-          Get-CimInstance Win32_ComputerSystem |
-            Select-Object NumberOfLogicalProcessors,
-              @{Name="RAM_GB";Expression={
-                [math]::Round($_.TotalPhysicalMemory / 1GB, 2)
-              }}
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale girişi başarısız. Auth key ve cihaz politikasını kontrol et."
+          }
 
-          Write-Host "RDP hizmeti:"
-          Get-Service TermService |
-            Select-Object Name, Status
+          Start-Sleep -Seconds 5
+          $ip = (& $env:TAILSCALE_EXE ip -4 | Select-Object -First 1).Trim()
 
-          Write-Host "RDP portu:"
-          Get-NetTCPConnection -State Listen `
-            -LocalPort 3389 -ErrorAction SilentlyContinue |
-            Select-Object LocalAddress, LocalPort, State
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "Tailscale IPv4 adresi alınamadı."
+          }
 
-          Write-Host "RDP kullanicisi: Draghyper"
-          Write-Host "Tailscale IP: $env:RDP_IP"
-          Write-Host "RDP portu: 3389"
-          Write-Host "Parola gunluge yazdirilmadi."
+          "RDP_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale bağlantısı hazır."
+          Write-Host "RDP IP: $ip"
+          Write-Host "Kullanıcı adı: Draghyper"
 
-      # 4. OTURUMU ACIK TUT
-      - name: Keep Session Alive
+      - name: Verify RDP and Audio Policies
         shell: pwsh
         run: |
-          Write-Host "RDP oturumu hazir. GitHub sure siniri gecerlidir."
+          $rdp = Get-ItemProperty `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          Write-Host "RDP etkin: $($rdp.fDenyTSConnections -eq 0)"
 
-          while ($true) {
-            Start-Sleep -Seconds 300
+          $policy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          $audio = Get-ItemProperty -Path $policy
+
+          Write-Host "Mikrofon yönlendirmesi engellenmiyor: $($audio.fDisableAudioCapture -eq 0)"
+          Write-Host "Ses çıkışı yönlendirmesi engellenmiyor: $($audio.fDisableAudioPlayback -eq 0)"
+
+          Get-NetTCPConnection -LocalPort 3389 -State Listen `
+            -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, LocalPort, State |
+            Format-Table
+
+      - name: Maintain Connection
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host "RDP oturumu 6 saate kadar açık tutulacak."
+          Write-Host "Adres: $env:RDP_IP"
+          Write-Host "Kullanıcı adı: Draghyper"
+          Write-Host "Parola, GitHub RDP_PASSWORD secret değeridir."
+          Write-Host "Parola güvenlik nedeniyle günlükte gösterilmiyor."
+
+          for ($i = 1; $i -le 360; $i++) {
+            Write-Host "Bağlantı aktif. Geçen süre: $i dakika"
+            Start-Sleep -Seconds 60
           }
+          
