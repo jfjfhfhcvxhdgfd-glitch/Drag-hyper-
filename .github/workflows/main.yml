@@ -125,6 +125,17 @@ jobs:
 
           Write-Host "Not: Mikrofonun görünmesi, RDP istemcisinin ve oturumun yönlendirmeyi desteklemesine de bağlıdır."
 
+          # Apply the computer policy before a new RDP session is created.
+          gpupdate /target:computer /force
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "gpupdate başarısız oldu; kayıt defteri ilkeleri yine de yazıldı."
+          }
+
+          # Restart RDP after microphone redirection policy has been written.
+          Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 3
+          Write-Host "RDP servisi ses yönlendirme ilkelerinden sonra yeniden başlatıldı."
+
       - name: Install Tailscale
         shell: pwsh
         run: |
